@@ -13,9 +13,10 @@ from torch import Tensor
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader
 from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
-from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
+from torch.distributed.fsdp import CPUOffloadPolicy, FSDPModule, MixedPrecisionPolicy, OffloadPolicy, fully_shard
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, PretrainedConfig
 from transformers.tokenization_utils import PreTrainedTokenizer
+from transformers.utils.import_utils import is_flash_attn_3_available
 
 from prime_rl.trainer.config import ActivationCheckpointConfig, CompileConfig, ModelConfig
 from prime_rl.trainer.lora import apply_lora_to_model
@@ -100,7 +101,7 @@ def get_model(
             case "custom":
                 model_cls = AutoModelForCausalLMPrimeRL
 
-        load_model_start_time = time.time()
+        load_model_start_time = time.perf_counter()
         if device == torch.device("meta"):
             logger.info(f"Loading model {config.name} using {model_cls.__name__} to meta device")
             model = model_cls.from_config(model_config, trust_remote_code=config.trust_remote_code, dtype=dtype)
@@ -112,7 +113,7 @@ def get_model(
                 trust_remote_code=config.trust_remote_code,
                 dtype=dtype,
             )
-        logger.debug(f"Loaded model {config.name} in {time.time() - load_model_start_time:.2f} seconds")
+        logger.debug(f"Loaded model {config.name} in {time.perf_counter() - load_model_start_time:.2f} seconds")
 
     assert model.lm_head.weight.dtype == dtype, (
         f"LM head dtype wasnt loaded correctly {model.lm_head.weight.dtype} != {dtype}"
@@ -128,17 +129,17 @@ def setup_tokenizer(config: ModelConfig) -> PreTrainedTokenizer:
 
 def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
     mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=DTYPE_MAP[config.reduce_dtype])
-    # TODO: Support dp_replicate
-    if config.dp_replicate > 1:
-        hsdp_mesh = parallel_dims.world_mesh["dp_replicate", "dp_shard_cp"]
-    else:
-        hsdp_mesh = parallel_dims.world_mesh["dp_shard_cp"]
+    # Always use 2D mesh format for consistency (dp_replicate dimension always present)
+    hsdp_mesh = parallel_dims.world_mesh["dp_replicate", "dp_shard_cp"]
+
+    offload_policy: OffloadPolicy = CPUOffloadPolicy(pin_memory=True) if config.fsdp_cpu_offload else OffloadPolicy()
 
     for transformer_block in model.model.layers:
         fully_shard(
             transformer_block,
             mesh=hsdp_mesh,
             mp_policy=mp_policy,
+            offload_policy=offload_policy,
             reshard_after_forward=config.reshard_after_forward,
         )
 
@@ -148,22 +149,31 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
             model.model.embed_tokens,
             mesh=hsdp_mesh,
             mp_policy=mp_policy,
+            offload_policy=offload_policy,
             reshard_after_forward=config.reshard_after_forward,
         )
         fully_shard(
             [model.lm_head, model.model.norm],
             mesh=hsdp_mesh,
             mp_policy=mp_policy,
+            offload_policy=offload_policy,
             reshard_after_forward=False,
         )
     else:
         get_logger().warning("Model is tied word embeddings, so not doing the last layer not resharding optimization")
 
-    fully_shard(model, mesh=hsdp_mesh, mp_policy=mp_policy, reshard_after_forward=config.reshard_after_forward)
+    fully_shard(
+        model,
+        mesh=hsdp_mesh,
+        mp_policy=mp_policy,
+        offload_policy=offload_policy,
+        reshard_after_forward=config.reshard_after_forward,
+    )
 
 
 def load_dcp_from_hf(model: nn.Module, config: ModelConfig):
     model.to_empty(device="cuda")
+    torch.distributed.barrier()
 
     logger = get_logger()
     if config.debug.random_init:
@@ -198,8 +208,6 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig):
                 convert_hf_to_tt_moe(snapshot_state_dict)
                 save_state_dict(snapshot_state_dict, snapshot_path)
 
-        # All ranks wait for master rank to finish conversion
-        torch.distributed.barrier()
     elif has_tt_moe_layers(snapshot_state_dict) and has_hf_moe_layers(model_state_dict):
         logger.warning(
             "Found TT weight format in snapshot state dict and HF weight format in model state dict. Trying to auto-convert..."
@@ -215,11 +223,11 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig):
                 convert_tt_to_hf_moe(snapshot_state_dict)
                 save_state_dict(snapshot_state_dict, snapshot_path)
 
-        # All ranks wait for master rank to finish conversion
-        torch.distributed.barrier()
+    # All ranks wait for master rank to finish conversion
+    torch.distributed.barrier()
 
     logger.info(f"Loading weights using HF DCP from {snapshot_path}")
-    load_dcp_start_time = time.time()
+    load_dcp_start_time = time.perf_counter()
     dcp_load(
         model.state_dict(),
         storage_reader=HuggingFaceStorageReader(path=snapshot_path.as_posix()),
@@ -227,7 +235,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig):
         # planner=DefaultLoadPlanner(allow_partial_load=True),
     )
     fix_model_post_empty(model)
-    logger.debug(f"Loaded weights using HF DCP in {time.time() - load_dcp_start_time:.2f} seconds")
+    logger.debug(f"Loaded weights using HF DCP in {time.perf_counter() - load_dcp_start_time:.2f} seconds")
 
 
 def can_load_dcp_from_hf(model: nn.Module):
@@ -290,6 +298,11 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig):
 
 
 def setup_model(config: ModelConfig, parallel_dims: ParallelDims) -> nn.Module:
+    if config.attn == "flash_attention_3" and not is_flash_attn_3_available():
+        raise ValueError(
+            "Flash attention 3 is only supported if the flash_attn_3 package is installed. Install with `uv pip install 'flash-attn-3 @ git+https://github.com/Dao-AILab/flash-attention.git@main#subdirectory=hopper' --no-build-isolation`"
+        )
+
     logger = get_logger()
     # Get model from specified device
     model = get_model(
