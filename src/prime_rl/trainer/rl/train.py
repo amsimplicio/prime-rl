@@ -79,9 +79,11 @@ def train(config: RLTrainerConfig):
         )
 
     # Initialize the model and tokenizer
-    logger.info(f"Initializing model and tokenizer ({config.model})")
+    logger.info(f"Initializing model ({config.model})")
     model = setup_model(config.model, parallel_dims)
-    tokenizer = setup_tokenizer(config.model)
+
+    logger.info(f"Initializing tokenizer ({config.tokenizer})")
+    tokenizer = setup_tokenizer(config.tokenizer)
 
     # Set up the optimizer
     logger.info(f"Initializing optimizer ({config.optim})")
@@ -95,7 +97,9 @@ def train(config: RLTrainerConfig):
 
     # Set up weight broadcast
     logger.info(f"Initializing weight broadcast ({config.weight_broadcast})")
-    weight_broadcast = setup_weight_broadcast(config.output_dir, config.weight_broadcast)
+    weight_broadcast = setup_weight_broadcast(
+        config.output_dir, config.weight_broadcast, config.model.experimental.lora
+    )
 
     # Set up checkpoint manager
     logger.info(f"Initializing checkpoint managers ({config.ckpt})")
@@ -135,7 +139,9 @@ def train(config: RLTrainerConfig):
         last_async_level_steps = config.max_steps and progress.step >= config.max_steps - config.max_async_level
         if progress.step > 0 and (not last_async_level_steps or config.weight_broadcast.type == "filesystem"):
             broadcast_weights_start_time = time.perf_counter()
-            weight_broadcast.broadcast_weights(model, step=progress.step)
+            weight_broadcast.broadcast_weights(
+                model, step=progress.step, adapter_only=config.weight_broadcast.adapter_only
+            )
             broadcast_weights_time = time.perf_counter() - broadcast_weights_start_time
             # Clean up old broadcast directories (unless at ckpt interval if using filesystem weight broadcast)
             ckpt_interval = config.ckpt and config.ckpt.interval
@@ -208,9 +214,6 @@ def train(config: RLTrainerConfig):
         logger.info(f"Starting forward and backward pass ({batch_size=})")
         tensors = Tensors()  # Used to accumulate tensor statistics across micro-batches and ranks for logging
         for micro_step, micro_batch in enumerate(micro_batches):
-            # we only all reduce at the last grad acc step
-            model.set_requires_all_reduce(micro_step == len(micro_batches) - 1)
-
             input_ids = micro_batch["input_ids"].to("cuda")
             position_ids = micro_batch["position_ids"].to("cuda")
             advantages = micro_batch["advantages"].to("cuda")

@@ -10,6 +10,7 @@ from prime_rl.trainer.config import (
     ModelConfig,
     OptimizerConfigType,
     SchedulerConfigType,
+    TokenizerConfig,
 )
 from prime_rl.utils.config import LogConfig, WandbMonitorConfig
 from prime_rl.utils.pydantic_config import BaseConfig, BaseSettings
@@ -48,7 +49,13 @@ class DataLoaderConfig(BaseConfig):
     fake: Annotated[FakeDataLoaderConfig | None, Field(description="Whether to use a fake data loader.")] = None
 
 
-class FileSystemWeightBroadcastConfig(BaseModel):
+class BaseWeightBroadcastConfig(BaseModel):
+    """Configures the base weight broadcast."""
+
+    adapter_only: Annotated[bool, Field(description="Whether to save LoRA adapters only for weight broadcast.")] = False
+
+
+class FileSystemWeightBroadcastConfig(BaseWeightBroadcastConfig):
     """Configures the weight broadcast."""
 
     type: Literal["filesystem"] = "filesystem"
@@ -58,7 +65,7 @@ class FileSystemWeightBroadcastConfig(BaseModel):
     ] = "safetensors"
 
 
-class NCCLWeightBroadcastConfig(BaseModel):
+class NCCLWeightBroadcastConfig(BaseWeightBroadcastConfig):
     """Configures the NCCL broadcast."""
 
     type: Literal["nccl"] = "nccl"
@@ -77,6 +84,9 @@ class RLTrainerConfig(BaseSettings):
 
     # The model configuration
     model: ModelConfig = ModelConfig()
+
+    # The tokenizer configuration
+    tokenizer: TokenizerConfig = TokenizerConfig()
 
     # The data configuration
     data: DataLoaderConfig = DataLoaderConfig()
@@ -193,4 +203,21 @@ class RLTrainerConfig(BaseSettings):
     def validate_opt_and_fsdp_offload(self):
         if self.optim.type == "muon" and self.model.fsdp_cpu_offload:
             raise ValueError("Muon optimizer does not support FSDP CPU offload")
+        return self
+
+    @model_validator(mode="after")
+    def validate_lora_broadcast(self):
+        if self.weight_broadcast.adapter_only and not self.model.experimental.lora:
+            raise ValueError("Adapter only weight broadcast requires LoRA to be enabled.")
+        if self.weight_broadcast.type == "nccl" and self.weight_broadcast.adapter_only:
+            # TODO: Support this
+            raise ValueError("NCCL weight broadcast does not support LoRA yet.")
+        return self
+
+    @model_validator(mode="after")
+    def auto_setup_tokenizer(self):
+        if self.tokenizer.name is None:
+            self.tokenizer.name = self.model.name
+        if self.tokenizer.trust_remote_code is None:
+            self.tokenizer.trust_remote_code = self.model.trust_remote_code
         return self
