@@ -309,7 +309,7 @@ async def orchestrate(config: OrchestratorConfig):
         solve_none = results_df.groupby("example_id").apply(lambda x: x.reward.sum() == 0, include_groups=False).mean()
         effective_batch_size = 1 - solve_none - solve_all
 
-        # Compute per-env reuslts
+        # Compute per-env results
         num_envs_in_batch = results_df.task.nunique()
         per_env_reward = results_df.groupby("task").reward.mean().to_dict() if num_envs_in_batch > 1 else None
         per_env_count = results_df.task.value_counts().to_dict() if num_envs_in_batch > 1 else None
@@ -362,10 +362,16 @@ async def orchestrate(config: OrchestratorConfig):
         # If more than one env, add per-env metrics
         if results_df.task.nunique() > 1:
             per_env_reward = results_df.groupby("task").reward.mean().to_dict()
-            to_log.update({f"reward/{env}": reward for env, reward in per_env_reward.items()})
+            to_log.update({f"reward/{env_name}": reward for env_name, reward in per_env_reward.items()})
 
             per_env_count = results_df.task.value_counts().to_dict()
-            to_log.update({f"batch/{env}": count for env, count in per_env_count.items()})
+            to_log.update({f"batch/{env_name}": count for env_name, count in per_env_count.items()})
+
+            # NEW: log per-env reward and counts to the console
+            logger.info(
+                f"[ORCH] step={progress.step} per_env_reward={per_env_reward} "
+                f"per_env_count={per_env_count}"
+            )
 
         # Optionally, add val metrics
         if val_results_df is not None:
@@ -373,10 +379,10 @@ async def orchestrate(config: OrchestratorConfig):
 
             if val_results_df.task.nunique() > 1:
                 per_env_reward = val_results_df.groupby("task").reward.mean().to_dict()
-                to_log.update({f"val_reward/{env}": reward for env, reward in per_env_reward.items()})
+                to_log.update({f"val_reward/{env_name}": reward for env_name, reward in per_env_reward.items()})
 
                 per_env_count = val_results_df.task.value_counts().to_dict()
-                to_log.update({f"val_batch/{env}": count for env, count in per_env_count.items()})
+                to_log.update({f"val_batch/{env_name}": count for env_name, count in per_env_count.items()})
 
         # Log metrics to W&B
         monitor.log(to_log)
@@ -401,7 +407,22 @@ async def orchestrate(config: OrchestratorConfig):
         # Log distributions to W&B table
         monitor.log_distributions(distributions=distributions, step=progress.step)
 
-        step_message = f"Step {progress.step} | Time: {step_time:.2f}s | Reward: {results_df.reward.mean():.4f} |{f' Val. Reward: {val_results_df.reward.mean():.4f} |' if val_results_df is not None else ''} Throughput: {throughput:.1f} tokens/s | Seq. Length: {results_df.seq_len.mean():.1f} tokens/sample | Async Level: {scheduler.async_level} | Max. Off-Policy Level: {scheduler.max_off_policy_level}"
+        # Optional compact summary of per-env rewards for this step in the main line
+        if results_df.task.nunique() > 1:
+            per_env_reward = results_df.groupby("task").reward.mean().to_dict()
+            per_env_str = ", ".join(f"{env_name}={r:.3f}" for env_name, r in per_env_reward.items())
+            per_env_part = f" | EnvReward: {per_env_str}"
+        else:
+            per_env_part = ""
+
+        step_message = (
+            f"Step {progress.step} | Time: {step_time:.2f}s | "
+            f"Reward: {results_df.reward.mean():.4f} |"
+            f"{f' Val. Reward: {val_results_df.reward.mean():.4f} |' if val_results_df is not None else ''} "
+            f"Throughput: {throughput:.1f} tokens/s | Seq. Length: {results_df.seq_len.mean():.1f} tokens/sample | "
+            f"Async Level: {scheduler.async_level} | Max. Off-Policy Level: {scheduler.max_off_policy_level}"
+            f"{per_env_part}"
+        )
         logger.success(step_message)
 
         # Increment step
