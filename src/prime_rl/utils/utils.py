@@ -1,15 +1,18 @@
 import asyncio
 import functools
 import os
+import subprocess
 import time
 from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.distributed as dist
 import wandb
 
+from prime_rl.orchestrator.config import EnvConfig, EvalEnvConfig
 from prime_rl.utils.logger import get_logger
 
 
@@ -89,32 +92,43 @@ def capitalize(s: str) -> str:
     return s[0].upper() + s[1:]
 
 
-def clean_exit(func):
+def clean_exit(func: Callable) -> Callable:
     """
     A decorator that ensures the a torch.distributed process group is properly
     cleaned up after the decorated function runs or raises an exception.
-
-    Args:
-        func: The function to decorate
-
-    Returns:
-        The decorated function
     """
+    if asyncio.iscoroutinefunction(func):
 
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        try:
-            ret = func(*args, **kwargs)
-            wandb.finish()
-            return ret
-        except Exception as e:
-            wandb.finish(exit_code=1)
-            raise e
-        finally:
-            if dist.is_initialized():
-                dist.destroy_process_group()
+        @functools.wraps(func)
+        async def async_wrapper(*args, **kwargs):
+            try:
+                ret = await func(*args, **kwargs)
+                wandb.finish()
+                return ret
+            except Exception as e:
+                wandb.finish(exit_code=1)
+                raise e
+            finally:
+                if dist.is_initialized():
+                    dist.destroy_process_group()
 
-    return wrapper
+        return async_wrapper
+    else:
+
+        @functools.wraps(func)
+        def sync_wrapper(*args, **kwargs):
+            try:
+                ret = func(*args, **kwargs)
+                wandb.finish()
+                return ret
+            except Exception as e:
+                wandb.finish(exit_code=1)
+                raise e
+            finally:
+                if dist.is_initialized():
+                    dist.destroy_process_group()
+
+        return sync_wrapper
 
 
 def sync_wait_for_path(path: Path, interval: int = 1, log_interval: int = 10) -> None:
@@ -291,3 +305,33 @@ def mean_normalize(values: list[float] | list[int]) -> list[float]:
     """Mean-Normalize a list of values to 0-1."""
     sum_values = sum(values)
     return [value / sum_values if sum_values > 0 else 0 for value in values]
+
+
+@contextmanager
+def default_dtype(dtype):
+    prev = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(prev)
+
+
+def install_env(env_id: str) -> None:
+    """Install an environment in subprocess."""
+    logger = get_logger()
+    logger.info(f"Installing environment {env_id}")
+    install_cmd = ["uv", "run", "--no-sync", "prime", "env", "install", env_id]
+    result = subprocess.run(install_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to install environment {env_id} (stdout={result.stdout}, stderr={result.stderr})")
+    logger.info(f"Successfully installed environment {env_id}")
+
+
+def get_env_ids_to_install(env_configs: list[EnvConfig] | list[EvalEnvConfig]) -> set[str]:
+    """Get the list of environment IDs to install."""
+    env_ids_to_install = set()
+    for env_config in env_configs:
+        if "/" in env_config.id:
+            env_ids_to_install.add(env_config.id)
+    return env_ids_to_install

@@ -2,12 +2,13 @@ import time
 from contextlib import nullcontext
 from datetime import timedelta
 
+from torch.nn import CrossEntropyLoss
+
 # Import environment before any other imports
 # ruff: noqa: I001
 
 from prime_rl.utils.act_offloading import maybe_activation_offloading
 import torch
-from torch.nn.functional import cross_entropy
 from torch.distributed.tensor.experimental import context_parallel
 from torch.profiler import profile, ProfilerActivity, record_function
 from loguru import logger
@@ -33,10 +34,12 @@ from prime_rl.trainer.utils import (
     print_benchmark,
 )
 from prime_rl.trainer.world import get_world
+from prime_rl.utils.heartbeat import Heartbeat
 from prime_rl.utils.monitor import setup_monitor
 from prime_rl.utils.pydantic_config import parse_argv
 from prime_rl.utils.utils import clean_exit, to_col_format
 import torch.distributed as dist
+from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
 
 
 @clean_exit
@@ -58,6 +61,12 @@ def train(config: SFTTrainerConfig):
     logger.info(f"Initializing monitor ({config.wandb})")
     monitor = setup_monitor(config.wandb, output_dir=config.output_dir, run_config=config)
 
+    # Setup heartbeat (only on rank 0)
+    heart = None
+    if config.heartbeat is not None and world.rank == 0:
+        logger.info("Initializing heartbeat")
+        heart = Heartbeat(config.heartbeat.url)
+
     # Set precision
     setup_torch_distributed(
         timeout=timedelta(seconds=config.dist_timeout_seconds), enable_gloo=config.model.fsdp_cpu_offload
@@ -67,10 +76,20 @@ def train(config: SFTTrainerConfig):
     # Initialize parallel dimensions
     parallel_dims = get_parallel_dims(config.model, config.data.seq_len)
 
+    total_micro_batches = config.data.batch_size * config.model.cp * config.model.tp
+    micro_batches_per_step = world.world_size * config.data.micro_batch_size
+    assert total_micro_batches % micro_batches_per_step == 0, (
+        f"batch_size * cp * tp ({total_micro_batches}) must be divisible by "
+        f"world_size * micro_batch_size ({micro_batches_per_step})"
+    )
+    grad_accum_steps = total_micro_batches // micro_batches_per_step
+
     # Initialize the model and tokenizer
-    logger.info(f"Initializing model and tokenizer ({config.model})")
+    logger.info(f"Initializing model ({config.model})")
     model = setup_model(config.model, parallel_dims)
-    tokenizer = setup_tokenizer(config.model)
+
+    logger.info(f"Initializing tokenizer ({config.tokenizer})")
+    tokenizer = setup_tokenizer(config.tokenizer)
 
     # Set up the optimizer
     logger.info(f"Initializing optimizer ({config.optim})")
@@ -98,17 +117,6 @@ def train(config: SFTTrainerConfig):
     dataloader = setup_dataloader(dataset, config.data)
     dataiter = iter(dataloader)
 
-    # Check that the world size and batch configuration is compatible
-    num_micro_batches = config.data.batch_size // config.data.micro_batch_size
-    if world.world_size > num_micro_batches:
-        raise ValueError(
-            f"There must be at least one micro batch per rank, but only have {num_micro_batches} micro batches for {world.world_size} ranks."
-        )
-    if num_micro_batches % world.world_size != 0:
-        raise ValueError(
-            f"The number of micro batches ({num_micro_batches}) must be divisible by the world size ({world.world_size})."
-        )
-
     # Optionally, resume training from a checkpoint
     progress = Progress()
     if ckpt_manager is not None and config.ckpt and config.ckpt.resume_step:
@@ -127,6 +135,14 @@ def train(config: SFTTrainerConfig):
     logger.info(
         f"Starting from step {progress.step} (total_tokens={progress.total_tokens}, total_samples={progress.total_samples}, dataset_state={dataloader.state_dict()['dataset_state']})"
     )
+
+    match config.loss_impl:
+        case "liger":
+            ce_loss = LigerCrossEntropyLoss(reduction="none")
+        case "torch":
+            ce_loss = CrossEntropyLoss(reduction="none")
+        case _:
+            raise ValueError(f"Invalid loss implementation: {config.loss_impl}")
 
     logger.info(f"Starting training loop (max_steps={config.max_steps or 'infinite'})")
     max_memory = torch.cuda.mem_get_info()[1] / 1024**3  # GiB
@@ -175,19 +191,11 @@ def train(config: SFTTrainerConfig):
 
         step_start_time = time.perf_counter()
         forward_backward_start_time = time.perf_counter()
-        grad_accum_steps = (
-            config.data.batch_size
-            * config.model.cp
-            * config.model.tp
-            // (world.world_size * config.data.micro_batch_size)
-        )
 
         batch_loss = torch.tensor(0.0).to("cuda")
         nan_loss_count = torch.tensor(0).to("cuda")
         batch_max_vio, max_vio = torch.tensor(0.0).to("cuda"), None
         for micro_step in range(grad_accum_steps):
-            model.set_requires_all_reduce(micro_step == grad_accum_steps - 1)
-
             micro_batch = next(dataiter)
             input_ids = micro_batch["input_ids"].to("cuda")
             position_ids = micro_batch["position_ids"].to("cuda")
@@ -218,7 +226,7 @@ def train(config: SFTTrainerConfig):
                 B, L, V = logits.shape
 
                 # Compute loss
-                loss = cross_entropy(logits.view(-1, V), target_ids.view(-1), reduction="none").view(B, L)
+                loss = ce_loss(logits.view(-1, V), target_ids.view(-1)).view(B, L)
 
                 # Compute average loss over unmasked tokens
                 loss = loss[loss_mask].mean()
@@ -278,7 +286,8 @@ def train(config: SFTTrainerConfig):
         dist.all_reduce(nan_loss_count, op=dist.ReduceOp.SUM)
 
         # Compute step metrics
-        num_tokens = config.data.batch_size * config.data.seq_len
+        # Divide by CP and TP since those ranks process the same data
+        num_tokens = config.data.batch_size * config.data.seq_len // (config.model.cp * config.model.tp)
         progress.total_tokens += num_tokens
         progress.total_samples = dataset.step
         perf_counter = get_perf_counter(model, config.data.seq_len)
@@ -362,6 +371,10 @@ def train(config: SFTTrainerConfig):
         is_first_step = False
         progress.step += 1
 
+        # Send heartbeat if configured
+        if heart is not None:
+            heart.beat()
+
     if config.trace_path:
         prof.__exit__(None, None, None)
         config.trace_path.mkdir(parents=True, exist_ok=True)
@@ -369,9 +382,6 @@ def train(config: SFTTrainerConfig):
         logger.info(f"Saving trace to {trace_file}")
         prof.export_chrome_trace(trace_file)
         logger.info(f"Saved trace to {trace_file}")
-
-    # Log final (immutable) distributions to W&B table
-    monitor.log_final_distributions()
 
     # Write final checkpoint
     if ckpt_manager is not None:

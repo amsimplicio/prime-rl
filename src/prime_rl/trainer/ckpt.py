@@ -19,11 +19,10 @@ from transformers.tokenization_utils import PreTrainedTokenizer
 
 from prime_rl.trainer.config import CheckpointConfig, LoRAConfig, WeightCheckpointConfig
 from prime_rl.trainer.lora import has_lora_layers, save_lora_config
+from prime_rl.trainer.models import PreTrainedModelPrimeRL
 from prime_rl.trainer.weights import (
-    convert_tt_to_hf_moe,
     gather_weights_on_master,
     get_adapter_state_dict,
-    has_tt_moe_layers,
     save_state_dict,
 )
 from prime_rl.trainer.world import get_world
@@ -301,14 +300,11 @@ class WeightCheckpointManager:
 
         # Gather all weights on master rank
         self.logger.debug("Gathering weights on master rank for weight checkpoint")
-        has_lora = has_lora_layers(model)
         start_time = time.perf_counter()
-        state_dict = gather_weights_on_master(
-            model, self.world.is_master, dtype=torch.bfloat16, has_lora_layers=has_lora
-        )
+        state_dict = gather_weights_on_master(model, self.world.is_master, dtype=torch.bfloat16)
         self.logger.debug(f"Gathered weights on master rank in {time.perf_counter() - start_time:.2f} seconds")
 
-        if has_lora:
+        if has_lora_layers(model):
             self.logger.debug("Getting LoRA state dict on master rank for weight checkpoint")
             start_time = time.perf_counter()
             lora_state_dict = get_adapter_state_dict(model, self.world.is_master)
@@ -316,12 +312,14 @@ class WeightCheckpointManager:
         else:
             lora_state_dict = None
 
-        # Convert TT-MoE layers to HF format if needed
-        if has_tt_moe_layers(state_dict):
-            self.logger.debug("Converting TT-MoE layers to HF format for weight checkpoint")
+        # Convert PrimeRL format to HF format if needed
+        if isinstance(model, PreTrainedModelPrimeRL) and model.is_prime_state_dict(state_dict):
+            self.logger.debug("Converting PrimeRL format to HF format for weight checkpoint")
             start_time = time.perf_counter()
-            convert_tt_to_hf_moe(state_dict)
-            self.logger.debug(f"Converted TT-MoE layers to HF format in {time.perf_counter() - start_time:.2f} seconds")
+            model.convert_to_hf(state_dict)
+            self.logger.debug(
+                f"Converted PrimeRL format to HF format in {time.perf_counter() - start_time:.2f} seconds"
+            )
 
         # Save weight checkpoint on master rank
         if self.world.is_master:

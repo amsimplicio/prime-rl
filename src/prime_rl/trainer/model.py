@@ -18,15 +18,11 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, Pretra
 from transformers.tokenization_utils import PreTrainedTokenizer
 from transformers.utils.import_utils import is_flash_attn_3_available
 
-from prime_rl.trainer.config import ActivationCheckpointConfig, CompileConfig, ModelConfig
-from prime_rl.trainer.lora import apply_lora_to_model
-from prime_rl.trainer.models import AutoModelForCausalLMPrimeRL
+from prime_rl.trainer.config import ActivationCheckpointConfig, CompileConfig, ModelConfig, TokenizerConfig
+from prime_rl.trainer.lora import apply_lora_to_model, strip_lora_from_state_dict
+from prime_rl.trainer.models import AutoModelForCausalLMPrimeRL, PreTrainedModelPrimeRL
 from prime_rl.trainer.parallel_dims import ParallelDims
 from prime_rl.trainer.weights import (
-    convert_hf_to_tt_moe,
-    convert_tt_to_hf_moe,
-    has_hf_moe_layers,
-    has_tt_moe_layers,
     load_state_dict,
     save_state_dict,
 )
@@ -51,18 +47,24 @@ def is_tt_moe_model(model: nn.Module) -> bool:
     return hasattr(model.config, "num_experts") or hasattr(model.config, "n_routed_experts")
 
 
-def get_load_balance_stats(model: nn.Module, reset_stats: bool = True) -> dict[str, Tensor | None]:
+def get_load_balance_stats(
+    model: nn.Module, reset_stats: bool = True, try_to_avoid_padding_experts: bool = True
+) -> dict[str, Tensor | None]:
     per_layer_max_vio = []
     for transformer_block in model.model.layers:
         # This is necessary for models that have mixed dense layers
         if not hasattr(transformer_block.mlp, "tokens_per_expert"):
             continue
-        tokens_per_expert = transformer_block.mlp.tokens_per_expert
+        tokens_per_expert: torch.Tensor = transformer_block.mlp.tokens_per_expert
+        if try_to_avoid_padding_experts:
+            tokens_per_expert = tokens_per_expert.sort(dim=0, descending=True).values[
+                transformer_block.mlp.router.top_k :
+            ]
         balanced_load = tokens_per_expert.mean()
         max_vio = (tokens_per_expert.max() - balanced_load) / balanced_load
         per_layer_max_vio.append(max_vio.item())
         if reset_stats:
-            tokens_per_expert.zero_()
+            transformer_block.mlp.tokens_per_expert.zero_()
     if len(per_layer_max_vio) == 0:
         return {"max_vio": None}
     return {"max_vio": torch.tensor(per_layer_max_vio, device=torch.device("cuda"))}
@@ -121,16 +123,22 @@ def get_model(
     return model
 
 
-def setup_tokenizer(config: ModelConfig) -> PreTrainedTokenizer:
+def setup_tokenizer(config: TokenizerConfig) -> PreTrainedTokenizer:
     tokenizer = AutoTokenizer.from_pretrained(config.name, trust_remote_code=config.trust_remote_code)
+    if config.chat_template is not None:
+        tokenizer.chat_template = config.chat_template
     tokenizer.pad_token_id = tokenizer.eos_token_id
+
     return tokenizer
 
 
 def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
     mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=DTYPE_MAP[config.reduce_dtype])
-    # Always use 2D mesh format for consistency (dp_replicate dimension always present)
-    hsdp_mesh = parallel_dims.world_mesh["dp_replicate", "dp_shard_cp"]
+    # TODO: Support dp_replicate
+    if config.dp_replicate > 1:
+        hsdp_mesh = parallel_dims.world_mesh["dp_replicate", "dp_shard_cp"]
+    else:
+        hsdp_mesh = parallel_dims.world_mesh["dp_shard_cp"]
 
     offload_policy: OffloadPolicy = CPUOffloadPolicy(pin_memory=True) if config.fsdp_cpu_offload else OffloadPolicy()
 
@@ -171,7 +179,7 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
     )
 
 
-def load_dcp_from_hf(model: nn.Module, config: ModelConfig):
+def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
     model.to_empty(device="cuda")
     torch.distributed.barrier()
 
@@ -193,48 +201,67 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig):
     model_state_dict = model.state_dict()
 
     # Dynamically convert between different weight formats if needed
-    if has_hf_moe_layers(snapshot_state_dict) and has_tt_moe_layers(model_state_dict):
-        logger.warning(
-            "Found HF weight format in snapshot state dict and TT weight format in model state dict. Trying to auto-convert..."
-        )
-        snapshot_path = snapshot_path / "tt"
-        if snapshot_path.exists():
-            logger.debug(f"Conversion found at {snapshot_path}.")
-        else:
-            if get_world().is_master:
-                logger.debug(
-                    f"Converting snapshot state dict to TT format and saving to {snapshot_path} on master rank. This is a one-time operation."
-                )
-                convert_hf_to_tt_moe(snapshot_state_dict)
-                save_state_dict(snapshot_state_dict, snapshot_path)
+    if isinstance(model, PreTrainedModelPrimeRL):
+        if model.is_hf_state_dict(snapshot_state_dict) and model.is_prime_state_dict(model_state_dict):
+            logger.warning(
+                "Found HF weight format in snapshot state dict and PrimeRL weight format in model state dict. Trying to auto-convert..."
+            )
+            snapshot_path = snapshot_path / "prime"
+            if snapshot_path.exists():
+                logger.debug(f"Conversion found at {snapshot_path}.")
+            else:
+                if get_world().is_master:
+                    logger.debug(
+                        f"Converting snapshot state dict to PrimeRL format and saving to {snapshot_path} on master rank. This is a one-time operation."
+                    )
+                    model.convert_to_prime(snapshot_state_dict)
+                    save_state_dict(snapshot_state_dict, snapshot_path)
 
-    elif has_tt_moe_layers(snapshot_state_dict) and has_hf_moe_layers(model_state_dict):
-        logger.warning(
-            "Found TT weight format in snapshot state dict and HF weight format in model state dict. Trying to auto-convert..."
-        )
-        snapshot_path = snapshot_path / "hf"
-        if snapshot_path.exists():
-            logger.debug(f"Conversion found at {snapshot_path}.")
-        else:
-            if get_world().is_master:
-                logger.debug(
-                    f"Converting snapshot state dict to HF format and saving to {snapshot_path} on master rank. This is a one-time operation."
-                )
-                convert_tt_to_hf_moe(snapshot_state_dict)
-                save_state_dict(snapshot_state_dict, snapshot_path)
+        elif model.is_prime_state_dict(snapshot_state_dict) and model.is_hf_state_dict(model_state_dict):
+            logger.warning(
+                "Found PrimeRL weight format in snapshot state dict and HF weight format in model state dict. Trying to auto-convert..."
+            )
+            snapshot_path = snapshot_path / "hf"
+            if snapshot_path.exists():
+                logger.debug(f"Conversion found at {snapshot_path}.")
+            else:
+                if get_world().is_master:
+                    logger.debug(
+                        f"Converting snapshot state dict to HF format and saving to {snapshot_path} on master rank. This is a one-time operation."
+                    )
+                    model.convert_to_hf(snapshot_state_dict)
+                    save_state_dict(snapshot_state_dict, snapshot_path)
 
     # All ranks wait for master rank to finish conversion
     torch.distributed.barrier()
 
     logger.info(f"Loading weights using HF DCP from {snapshot_path}")
     load_dcp_start_time = time.perf_counter()
+    state_dict = model.state_dict()
+    state_dict = strip_lora_from_state_dict(state_dict)
+    if model.config.tie_word_embeddings:
+        del state_dict["lm_head.weight"]
     dcp_load(
-        model.state_dict(),
+        state_dict,
         storage_reader=HuggingFaceStorageReader(path=snapshot_path.as_posix()),
-        # Note: This allow is needed by weight tying but could cause silent issues
-        # planner=DefaultLoadPlanner(allow_partial_load=True),
     )
-    fix_model_post_empty(model)
+    if isinstance(model, PreTrainedModelPrimeRL):
+        model.init_buffers_post_meta()
+    else:
+        fix_model_post_empty(model)
+    lora_modules = [m for m in model.modules() if hasattr(m, "_init_lora_parameters")]
+    if lora_modules:
+        generator: torch.Generator | None = None
+        if parallel_dims.dp_replicate_enabled:
+            # Synchronize LoRA initialization across dp_replicate ranks by broadcasting a seed
+            dp_replicate_mesh = parallel_dims.world_mesh["dp_replicate"]
+            seed_tensor = torch.empty(1, dtype=torch.long, device="cuda")
+            if dp_replicate_mesh.get_local_rank() == 0:
+                seed_tensor.random_()
+            torch.distributed.broadcast(seed_tensor, src=0, group=dp_replicate_mesh.get_group())
+            generator = torch.Generator(device="cuda").manual_seed(seed_tensor.item())
+        for module in lora_modules:
+            module._init_lora_parameters(generator)
     logger.debug(f"Loaded weights using HF DCP in {time.perf_counter() - load_dcp_start_time:.2f} seconds")
 
 
@@ -270,9 +297,6 @@ def fix_model_post_empty(model: nn.Module):
         rotary_emb = model.model.rotary_emb
         inv_freq, rotary_emb.attention_scaling = rotary_emb.rope_init_fn(rotary_emb.config, rotary_emb.inv_freq.device)
         rotary_emb.inv_freq.copy_(inv_freq)
-
-    # TODO: Init TT MoE buffers
-    # I think .to_empty() on gpu by default fills 0 so we are ok but this might not be guaranteed behavior
 
 
 def reshard_module(model: nn.Module):
@@ -329,7 +353,7 @@ def setup_model(config: ModelConfig, parallel_dims: ParallelDims) -> nn.Module:
     setup_fsdp(model, config, parallel_dims)
 
     if config.load_using_meta and can_load_dcp_from_hf(model):
-        load_dcp_from_hf(model, config)
+        load_dcp_from_hf(model, config, parallel_dims)
 
     logger.debug(f"Model signature: {get_module_signature(model, compress=True)}")
     return model

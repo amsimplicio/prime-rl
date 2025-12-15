@@ -41,6 +41,7 @@ from prime_rl.trainer.utils import (
     get_response_lengths,
 )
 from prime_rl.trainer.world import get_world
+from prime_rl.utils.heartbeat import Heartbeat
 from prime_rl.utils.monitor import setup_monitor
 from prime_rl.utils.pydantic_config import parse_argv
 from prime_rl.utils.utils import clean_exit, to_col_format
@@ -65,6 +66,12 @@ def train(config: RLTrainerConfig):
     logger.info(f"Initializing monitor ({config.wandb})")
     monitor = setup_monitor(config.wandb, output_dir=config.output_dir, run_config=config)
 
+    # Setup heartbeat (only on rank 0)
+    heart = None
+    if config.heartbeat is not None and world.is_master:
+        logger.info("Initializing heartbeat")
+        heart = Heartbeat(config.heartbeat.url)
+
     # Set precision
     setup_torch_distributed(
         timeout=timedelta(seconds=config.dist_timeout_seconds), enable_gloo=config.model.fsdp_cpu_offload
@@ -79,9 +86,11 @@ def train(config: RLTrainerConfig):
         )
 
     # Initialize the model and tokenizer
-    logger.info(f"Initializing model and tokenizer ({config.model})")
+    logger.info(f"Initializing model ({config.model})")
     model = setup_model(config.model, parallel_dims)
-    tokenizer = setup_tokenizer(config.model)
+
+    logger.info(f"Initializing tokenizer ({config.tokenizer})")
+    tokenizer = setup_tokenizer(config.tokenizer)
 
     # Set up the optimizer
     logger.info(f"Initializing optimizer ({config.optim})")
@@ -95,7 +104,9 @@ def train(config: RLTrainerConfig):
 
     # Set up weight broadcast
     logger.info(f"Initializing weight broadcast ({config.weight_broadcast})")
-    weight_broadcast = setup_weight_broadcast(config.output_dir, config.weight_broadcast)
+    weight_broadcast = setup_weight_broadcast(
+        config.output_dir, config.weight_broadcast, config.model.experimental.lora
+    )
 
     # Set up checkpoint manager
     logger.info(f"Initializing checkpoint managers ({config.ckpt})")
@@ -135,7 +146,9 @@ def train(config: RLTrainerConfig):
         last_async_level_steps = config.max_steps and progress.step >= config.max_steps - config.max_async_level
         if progress.step > 0 and (not last_async_level_steps or config.weight_broadcast.type == "filesystem"):
             broadcast_weights_start_time = time.perf_counter()
-            weight_broadcast.broadcast_weights(model, step=progress.step)
+            weight_broadcast.broadcast_weights(
+                model, step=progress.step, adapter_only=config.weight_broadcast.adapter_only
+            )
             broadcast_weights_time = time.perf_counter() - broadcast_weights_start_time
             # Clean up old broadcast directories (unless at ckpt interval if using filesystem weight broadcast)
             ckpt_interval = config.ckpt and config.ckpt.interval
@@ -208,9 +221,6 @@ def train(config: RLTrainerConfig):
         logger.info(f"Starting forward and backward pass ({batch_size=})")
         tensors = Tensors()  # Used to accumulate tensor statistics across micro-batches and ranks for logging
         for micro_step, micro_batch in enumerate(micro_batches):
-            # we only all reduce at the last grad acc step
-            model.set_requires_all_reduce(micro_step == len(micro_batches) - 1)
-
             input_ids = micro_batch["input_ids"].to("cuda")
             position_ids = micro_batch["position_ids"].to("cuda")
             advantages = micro_batch["advantages"].to("cuda")
@@ -348,16 +358,12 @@ def train(config: RLTrainerConfig):
         }
         monitor.log(time_metrics)
 
-        # Log distributions to W&B table if enabled
-        assert all(len(tensors) == 1 for tensors in tensors.values()), "Tensors must be lists of length 1"
-        distributions = {key: tensors[key][0] for key in tensors.keys()}
-        monitor.log_distributions(
-            distributions=distributions,
-            step=progress.step,
-        )
-
         progress.step += 1
         is_first_step = False
+
+        # Send heartbeat if configured
+        if heart is not None:
+            heart.beat()
 
     if config.trace_path:
         prof.__exit__(None, None, None)
@@ -366,9 +372,6 @@ def train(config: RLTrainerConfig):
         logger.info(f"Saving trace to {trace_file}")
         prof.export_chrome_trace(trace_file)
         logger.info(f"Saved trace to {trace_file}")
-
-    # Log final (immutable) distributions to W&B table
-    monitor.log_final_distributions()
 
     # Write final checkpoint
     if ckpt_manager is not None:
