@@ -141,22 +141,6 @@ def train(config: RLTrainerConfig):
         torch.cuda.reset_peak_memory_stats()
         is_last_step = config.max_steps is not None and progress.step == config.max_steps
 
-        # Broadcast weights at every step, (except step 0, because no need to broadcast the base model)
-        # Also, with NCCL broadcast, we do not broadcast weights the last async level step as the orchestrator is already finished and will not initialize the receive on the inference; for filesystem broadcast, we do "broadcast" until the final step to allow to resume from the broadcast directory
-        last_async_level_steps = config.max_steps and progress.step >= config.max_steps - config.max_async_level
-        if progress.step > 0 and (not last_async_level_steps or config.weight_broadcast.type == "filesystem"):
-            broadcast_weights_start_time = time.perf_counter()
-            weight_broadcast.broadcast_weights(
-                model, step=progress.step, adapter_only=config.weight_broadcast.adapter_only
-            )
-            broadcast_weights_time = time.perf_counter() - broadcast_weights_start_time
-            # Clean up old broadcast directories (unless at ckpt interval if using filesystem weight broadcast)
-            ckpt_interval = config.ckpt and config.ckpt.interval
-            interval_to_keep = ckpt_interval if config.weight_broadcast.type == "filesystem" else None
-            maybe_clean(weight_broadcast.broadcast_dir, progress.step, config.max_async_level, interval_to_keep)
-        else:
-            broadcast_weights_time = 0
-
         if (
             ckpt_manager is not None
             and (config.ckpt and config.ckpt.interval)
@@ -181,6 +165,9 @@ def train(config: RLTrainerConfig):
                 weight_ckpt_manager.maybe_clean()
         else:
             save_ckpt_time = 0
+        
+        # Initialize broadcast_weights_time for the first step
+        broadcast_weights_time = 0
 
         # Break if we have reached the maximum number of steps
         if config.max_steps is not None and progress.step >= config.max_steps:
@@ -302,6 +289,25 @@ def train(config: RLTrainerConfig):
         # Optionally, dump memory snapshot
         if memory_profiler is not None:
             memory_profiler.step()
+
+        # Ensure all ranks have finished training before broadcasting weights
+        # This prevents the orchestrator from loading partially updated weights in distributed training
+        dist.barrier()
+
+        # Broadcast weights at every step AFTER training completes
+        # Also, with NCCL broadcast, we do not broadcast weights the last async level step as the orchestrator is already finished and will not initialize the receive on the inference; for filesystem broadcast, we do "broadcast" until the final step to allow to resume from the broadcast directory
+        last_async_level_steps = config.max_steps and progress.step >= config.max_steps - config.max_async_level - 1
+        if not last_async_level_steps or config.weight_broadcast.type == "filesystem":
+            broadcast_weights_start_time = time.perf_counter()
+            # Broadcast weights for the NEXT step (progress.step + 1) since we just finished training this step
+            weight_broadcast.broadcast_weights(
+                model, step=progress.step + 1, adapter_only=config.weight_broadcast.adapter_only
+            )
+            broadcast_weights_time = time.perf_counter() - broadcast_weights_start_time
+            # Clean up old broadcast directories (unless at ckpt interval if using filesystem weight broadcast)
+            ckpt_interval = config.ckpt and config.ckpt.interval
+            interval_to_keep = ckpt_interval if config.weight_broadcast.type == "filesystem" else None
+            maybe_clean(weight_broadcast.broadcast_dir, progress.step + 1, config.max_async_level, interval_to_keep)
 
         # Synchronize the tensor metrics across all steps and ranks
         tensor_stats = tensors.compute_stats()

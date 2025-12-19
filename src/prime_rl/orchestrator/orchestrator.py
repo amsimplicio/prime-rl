@@ -410,10 +410,12 @@ async def orchestrate(config: OrchestratorConfig):
         # If more than one env, add per-env metrics
         if results_df.task.nunique() > 1:
             per_env_reward = results_df.groupby("task").reward.mean().to_dict()
-            to_log.update({f"reward/{env}": reward for env, reward in per_env_reward.items()})
+            #to_log.update({f"reward/{env}": reward for env, reward in per_env_reward.items()})
+            print({f"reward/{env}": reward for env, reward in per_env_reward.items()})
 
             per_env_count = results_df.task.value_counts().to_dict()
-            to_log.update({f"batch/{env}": count for env, count in per_env_count.items()})
+            #to_log.update({f"batch/{env}": count for env, count in per_env_count.items()})
+            print({f"batch/{env}": count for env, count in per_env_count.items()})
 
         # Optionally, add val metrics
         if val_results_df is not None:

@@ -1,3 +1,4 @@
+import os
 import time
 from pathlib import Path
 from typing import Literal
@@ -54,6 +55,20 @@ class FileSystemWeightBroadcast(WeightBroadcast):
 
             if adapter_only:
                 save_lora_config(self.lora_config, model, save_dir)
+
+            # Ensure all data is flushed to disk before notifying orchestrator
+            # This prevents race conditions where orchestrator tries to read incomplete files
+            self.logger.debug(f"Syncing weights to disk at {save_dir}")
+            for file_path in save_dir.iterdir():
+                if file_path.is_file():
+                    with open(file_path, 'rb') as f:
+                        os.fsync(f.fileno())
+            # Sync the directory itself
+            dir_fd = os.open(save_dir, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
 
             # Notify the orchestrator at the end of step to signal that it is safe to load weights from shared filesystem
             self.notify_orchestrator(step)
